@@ -44,4 +44,5 @@ This file tracks the real-time development progress of the Synthetic 5G-NIDD Tra
 - [x] Run a short controlled retraining experiment to validate the change.
 - [x] Generate synthetic samples from `checkpoints/model_final.pt`.
 - [x] Run statistical and ML utility evaluation on the new synthetic data.
+- [x] Compare the refinement against the earlier C-TimeGAN-style baseline.
 - [x] Document that training stability improved, but fidelity metrics did not improve over the earlier baseline.

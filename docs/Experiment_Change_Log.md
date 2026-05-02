@@ -2,6 +2,10 @@
 
 This document records the code changes made during the final experiment cycle and the measured impact on training and synthetic-data quality.
 
+## Baseline for comparison
+
+The earlier baseline was the already-trained C-TimeGAN-style model with class conditioning and WGAN-GP. That is the main model family used in this project, and the final experiment was a refinement of it rather than a completely separate architecture.
+
 ## What changed
 
 ### Training pipeline
@@ -35,7 +39,7 @@ This document records the code changes made during the final experiment cycle an
 
 ## Conclusion
 
-The experiment is useful as an ablation result: it shows that adding feature matching made training look cleaner, but it did not translate into better synthetic data. The stronger baseline remains the better result to report, while this run should be documented as a negative or neutral experiment.
+The experiment is useful as an ablation result: it shows that adding feature matching made training look cleaner, but it did not translate into better synthetic data. The earlier baseline remains the better result to report, while this run should be documented as a negative or neutral experiment.
 
 ## Recommended next step
 
