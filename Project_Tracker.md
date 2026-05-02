@@ -37,3 +37,11 @@ This file tracks the real-time development progress of the Synthetic 5G-NIDD Tra
 - [x] Implement Checkpointing and Resumption Logic.
 - [x] Implement Graceful Interruption mapping (KeyboardInterrupt).
 - [x] Implement WGAN-GP Gradient Penalty loop.
+
+## 🟩 Phase 7: Final Experimentation and Refinement (Completed)
+- [x] Add stronger class conditioning in the generator and discriminator.
+- [x] Add discriminator feature-matching loss to stabilize generator updates.
+- [x] Run a short controlled retraining experiment to validate the change.
+- [x] Generate synthetic samples from `checkpoints/model_final.pt`.
+- [x] Run statistical and ML utility evaluation on the new synthetic data.
+- [x] Document that training stability improved, but fidelity metrics did not improve over the earlier baseline.

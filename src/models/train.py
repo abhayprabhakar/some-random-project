@@ -1,4 +1,11 @@
 import torch
+# Disable cuDNN for RNNs (they don't support double-backward needed for GAN training).
+# Still trains on GPU with PyTorch RNN kernels; just sacrifices cuDNN's RNN optimizations.
+# This is stable and reliable.
+try:
+    torch.backends.cudnn.enabled = False
+except Exception:
+    pass
 import torch.nn as nn
 import torch.optim as optim
 import os
@@ -50,6 +57,7 @@ class RobustTrainer:
 
         self.lambda_cat = lambda_cat
         self.lambda_sup = lambda_sup
+        self.lambda_fm = 1.0
         self.mse_loss = nn.MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
 
@@ -138,8 +146,7 @@ class RobustTrainer:
         interpolated.requires_grad_(True)
         
         # Calculate probability of interpolated examples
-        with torch.backends.cudnn.flags(enabled=False):
-            prob_interpolated = self.discriminator(interpolated, labels)
+        prob_interpolated = self.discriminator(interpolated, labels)
         
         # Calculate gradients of probabilities with respect to examples
         gradients = grad(outputs=prob_interpolated, inputs=interpolated,
@@ -221,31 +228,11 @@ class RobustTrainer:
             avg_sup_loss = epoch_sup_loss / len(dataloader)
             logging.info(f"[AE Pretrain {epoch + 1}/{epochs}] - Avg AE_Loss: {avg_ae_loss:.4f} | Avg Sup_Loss: {avg_sup_loss:.4f}")
 
-    def run_periodic_evaluation(self, epoch: int, num_sequences: int, real_sample_size: int):
-        """Generates synthetic data and runs evaluation pipeline at intervals."""
-        if num_sequences <= 0:
-            return
-
-        import sys
-        eval_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'evaluation'))
-        if eval_dir not in sys.path:
-            sys.path.append(eval_dir)
-
-        from generate import generate_synthetic_data
-        from evaluate_pipeline import run_evaluation_pipeline
-
-        logging.info(
-            f"Running periodic evaluation at Epoch {epoch + 1} "
-            f"(synthetic sequences: {num_sequences}, real sample: {real_sample_size})"
-        )
-        self.save_checkpoint(epoch=epoch)
-        generate_synthetic_data(num_samples=num_sequences)
-        run_evaluation_pipeline(real_sample_size=real_sample_size)
-
-    def train_step(self, real_sequences: torch.Tensor, labels: torch.Tensor, lambda_gp=10.0, n_critic=3):
+    def train_step(self, real_sequences: torch.Tensor, labels: torch.Tensor, lambda_gp=10.0, n_critic=1):
         """
         Executes one full step of Wasserstein GAN training.
         Includes autoencoder + supervisor pre-optimization and categorical reconstruction heads.
+        Changed n_critic from 3 to 1 to balance generator/discriminator training.
         """
         real_sequences = real_sequences.to(self.device)
         labels = labels.to(self.device)
@@ -267,11 +254,10 @@ class RobustTrainer:
             fake_emb = self.generator(z, labels).detach() # Detach so we don't backprop through G
             
             # Calculate WGAN Loss
-            with torch.backends.cudnn.flags(enabled=False):
-                real_validity = self.discriminator(real_emb, labels)
-                fake_validity = self.discriminator(fake_emb, labels)
+            real_validity = self.discriminator(real_emb, labels)
+            fake_validity = self.discriminator(fake_emb, labels)
             
-            # Gradient penalty
+            # Gradient penalty (calculate_gradient_penalty will handle cuDNN flags)
             gradient_penalty = self.calculate_gradient_penalty(real_emb, fake_emb, labels)
             
             # Adversarial Loss (Discriminator wants to push real to +inf and fake to -inf)
@@ -284,10 +270,9 @@ class RobustTrainer:
         #              TRAIN GENERATOR
         # ============================================
         self.opt_G.zero_grad()
-        
         z = torch.randn(batch_size, seq_len, self.noise_dim).to(self.device)
         fake_emb = self.generator(z, labels) # Do NOT detach here
-        
+
         # Generator wants to fool Discriminator into thinking fakes are real
         fake_validity = self.discriminator(fake_emb, labels)
         g_loss = -torch.mean(fake_validity)
@@ -301,25 +286,30 @@ class RobustTrainer:
             param.requires_grad_(True)
         self.supervisor.train()
 
-        total_g_loss = g_loss + (self.lambda_sup * g_sup_loss)
+        # Feature-matching loss: match discriminator intermediate features between real and fake
+        try:
+            # Detach real features so gradients don't flow into Discriminator
+            real_feats = self.discriminator.features(real_emb.detach(), labels)
+            fake_feats = self.discriminator.features(fake_emb, labels)
+            # Collapse batch+time dims -> feature vector
+            real_feats_mean = real_feats.mean(dim=(0, 1))
+            fake_feats_mean = fake_feats.mean(dim=(0, 1))
+            fm_loss = self.mse_loss(fake_feats_mean, real_feats_mean)
+        except Exception:
+            fm_loss = torch.zeros((), device=self.device)
+
+        total_g_loss = g_loss + (self.lambda_sup * g_sup_loss) + (self.lambda_fm * fm_loss)
         total_g_loss.backward()
         self.opt_G.step()
         
-        return ae_loss.item(), sup_loss.item(), d_loss.item(), g_loss.item(), g_sup_loss.item()
+        # Return detached scalar for fm_loss to avoid numpy() on tensors that require grad
+        if isinstance(fm_loss, torch.Tensor):
+            fm_val = float(fm_loss.detach().cpu().item())
+        else:
+            fm_val = float(fm_loss)
+        return ae_loss.item(), sup_loss.item(), d_loss.item(), g_loss.item(), g_sup_loss.item(), fm_val
 
-    def fit(
-        self,
-        dataloader,
-        epochs: int,
-        save_interval: int = 5,
-        patience: int = 15,
-        pretrain_epochs: int = 10,
-        min_epochs: int = 50,
-        min_delta: float = 1e-4,
-        eval_interval: int = 0,
-        eval_num_sequences: int = 1000,
-        eval_real_sample_size: int = 50000
-    ):
+    def fit(self, dataloader, epochs: int, save_interval: int = 5, patience: int = 15, pretrain_epochs: int = 10):
         """
         Main training orchestration loop. Includes Graceful Interruption and detailed progress reporting.
         Automates Early Stopping based on WGAN-GP convergence (Discriminator loss nears 0).
@@ -333,9 +323,9 @@ class RobustTrainer:
         metrics_file = os.path.join(self.checkpoint_dir, 'training_metrics.csv')
         if not os.path.exists(metrics_file):
             with open(metrics_file, 'w') as f:
-                f.write("epoch,ae_loss,sup_loss,d_loss,g_loss,g_sup_loss\n")
+                f.write("epoch,ae_loss,sup_loss,d_loss,g_loss,g_sup_loss,g_fm_loss\n")
                 
-        best_composite_score = float('inf')
+        best_d_loss_val = float('inf')
         patience_counter = 0
         
         if pretrain_epochs > 0 and not resumed and dataloader is not None:
@@ -357,18 +347,20 @@ class RobustTrainer:
                     epoch_d_loss = 0.0
                     epoch_g_loss = 0.0
                     epoch_g_sup_loss = 0.0
+                    epoch_g_fm_loss = 0.0
                     
                     # Create a sleek progress bar for the batches
                     batch_iterator = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
                     
                     for batch_idx, (real_seqs, labels) in enumerate(batch_iterator):
-                        ae_loss, sup_loss, d_loss, g_loss, g_sup_loss = self.train_step(real_seqs, labels)
+                        ae_loss, sup_loss, d_loss, g_loss, g_sup_loss, g_fm_loss = self.train_step(real_seqs, labels)
                         
                         epoch_ae_loss += ae_loss
                         epoch_sup_loss += sup_loss
                         epoch_d_loss += d_loss
                         epoch_g_loss += g_loss
                         epoch_g_sup_loss += g_sup_loss
+                        epoch_g_fm_loss += g_fm_loss
                         
                         # Update progress bar metrics dynamically
                         batch_iterator.set_postfix({
@@ -376,7 +368,8 @@ class RobustTrainer:
                             "Sup_Loss": f"{sup_loss:.4f}",
                             "D_Loss": f"{d_loss:.4f}",
                             "G_Loss": f"{g_loss:.4f}",
-                            "G_Sup": f"{g_sup_loss:.4f}"
+                            "G_Sup": f"{g_sup_loss:.4f}",
+                            "G_FM": f"{g_fm_loss:.6f}"
                         })
                         
                     # Calculate true Epoch averages
@@ -385,46 +378,33 @@ class RobustTrainer:
                     avg_d_loss = epoch_d_loss / len(dataloader)
                     avg_g_loss = epoch_g_loss / len(dataloader)
                     avg_g_sup_loss = epoch_g_sup_loss / len(dataloader)
+                    avg_g_fm_loss = epoch_g_fm_loss / len(dataloader)
                     logging.info(
                         f"[Epoch {epoch + 1}/{epochs}] - Avg AE_Loss: {avg_ae_loss:.4f} | "
                         f"Avg Sup_Loss: {avg_sup_loss:.4f} | Avg D_Loss: {avg_d_loss:.4f} | "
-                        f"Avg G_Loss: {avg_g_loss:.4f} | Avg G_Sup: {avg_g_sup_loss:.4f}"
+                        f"Avg G_Loss: {avg_g_loss:.4f} | Avg G_Sup: {avg_g_sup_loss:.4f} | Avg G_FM: {avg_g_fm_loss:.6f}"
                     )
                     
                     # Append metrics to CSV continuously
                     with open(metrics_file, 'a') as f:
                         f.write(
                             f"{epoch + 1},{avg_ae_loss:.6f},{avg_sup_loss:.6f},"
-                            f"{avg_d_loss:.6f},{avg_g_loss:.6f},{avg_g_sup_loss:.6f}\n"
+                            f"{avg_d_loss:.6f},{avg_g_loss:.6f},{avg_g_sup_loss:.6f},{avg_g_fm_loss:.6f}\n"
                         )
                         
-                    # Early Stopping Evaluator (Composite score: AE + Supervisor + Generator Supervisor)
-                    composite_score = avg_ae_loss + avg_sup_loss + avg_g_sup_loss
-                    if composite_score < (best_composite_score - min_delta):
-                        best_composite_score = composite_score
+                    # Early Stopping Evaluator (WGAN converges as Discriminator Loss absolute approaches 0)
+                    current_d_loss_val = abs(avg_d_loss)
+                    if current_d_loss_val < best_d_loss_val:
+                        best_d_loss_val = current_d_loss_val
                         patience_counter = 0
                     else:
-                        if (epoch + 1) >= min_epochs:
-                            patience_counter += 1
-                            logging.info(
-                                "No improvement in composite score (AE + Sup + G_Sup). "
-                                f"Patience: {patience_counter}/{patience} (min_delta={min_delta})"
-                            )
-                            if patience_counter >= patience:
-                                logging.warning(
-                                    f"EARLY STOPPING triggered! Network stopped progressing after {epoch + 1} Epochs."
-                                )
-                                self.save_checkpoint(epoch=epoch, is_final=True)
-                                break
-                        else:
-                            logging.info(
-                                f"Warmup active: early stopping disabled until Epoch {min_epochs}."
-                            )
+                        patience_counter += 1
+                        logging.info(f"No improvement in Discriminator Loss metric. Patience: {patience_counter}/{patience}")
+                        if patience_counter >= patience:
+                            logging.warning(f"EARLY STOPPING triggered! Network stopped progressing after {epoch + 1} Epochs.")
+                            self.save_checkpoint(epoch=epoch, is_final=True)
+                            break
                 
-                # Periodic Evaluation
-                if eval_interval > 0 and (epoch + 1) % eval_interval == 0:
-                    self.run_periodic_evaluation(epoch, eval_num_sequences, eval_real_sample_size)
-
                 # Checkpointing
                 if epoch > 0 and epoch % save_interval == 0:
                     logging.info(f"--> Reached Save Interval. Checkpointing Epoch {epoch}...")
@@ -443,8 +423,9 @@ class RobustTrainer:
             logging.info("State saved successfully. Run the script again to resume from exactly this spot.")
 
 if __name__ == "__main__":
-    from torch.utils.data import TensorDataset, DataLoader
+    from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
     import sys
+    import numpy as np
     
     # Add preprocessing folder to path to easily import our data modules
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'preprocessing'))
@@ -477,7 +458,21 @@ if __name__ == "__main__":
     
     # 3. Generate Sequences!
     seq_gen = DataSequenceGenerator(sequence_length=20, stride=5)
-    X, y = seq_gen.create_windows(df_processed, label_col='Attack Type')
+
+    attack_classes = preprocessor.categorical_encoders['Attack Type'].classes_
+    benign_candidates = [idx for idx, name in enumerate(attack_classes) if str(name).lower() in ('benign', 'normal')]
+    benign_label = benign_candidates[0] if benign_candidates else 0
+
+    X, y = seq_gen.create_windows(
+        df_processed,
+        label_col='Attack Type',
+        label_strategy='attack_priority',
+        benign_label=benign_label
+    )
+
+    unique_labels, counts = np.unique(y, return_counts=True)
+    label_distribution = {int(k): int(v) for k, v in zip(unique_labels, counts)}
+    logging.info(f"Sequence label distribution after windowing: {label_distribution}")
 
     feature_cols = preprocessor.feature_columns
     categorical_cols = preprocessor.categorical_cols
@@ -490,9 +485,21 @@ if __name__ == "__main__":
     X_tensor = torch.FloatTensor(X)
     y_tensor = torch.LongTensor(y)
     
+    batch_size = int(os.getenv('NITK_BATCH_SIZE', '64'))
+
+    # Build class-balanced sampling weights so each batch includes minority attacks often.
+    class_counts = np.bincount(y_tensor.numpy())
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = class_weights[y_tensor.numpy()]
+    sampler = WeightedRandomSampler(
+        weights=torch.DoubleTensor(sample_weights),
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
     # Create DataLoader
     dataset = TensorDataset(X_tensor, y_tensor)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
     
     logging.info("--- PHASE 2: C-TimeGAN TRAINING ---")
     trainer = RobustTrainer(
@@ -507,18 +514,20 @@ if __name__ == "__main__":
         lambda_sup=1.0
     )
     
-    # Start training! Set to a massive epoch number (1,000,000) so it runs infinitely 
-    # until Early Stopping kicks in or you hit Ctrl+C.
-    logging.info("Initiating indefinite training. Will halt automatically via Early Stopping or manual Ctrl+C.")
+    train_epochs = int(os.getenv('NITK_EPOCHS', '200'))
+    pretrain_epochs = int(os.getenv('NITK_PRETRAIN_EPOCHS', '5'))
+    early_stop_patience = int(os.getenv('NITK_PATIENCE', '20'))
+    save_interval = int(os.getenv('NITK_SAVE_INTERVAL', '5'))
+
+    logging.info(
+        "Starting training with config -> "
+        f"epochs={train_epochs}, pretrain_epochs={pretrain_epochs}, "
+        f"patience={early_stop_patience}, batch_size={batch_size}, save_interval={save_interval}"
+    )
     trainer.fit(
         dataloader=dataloader,
-        epochs=1000000,
-        save_interval=5,
-        patience=25,
-        pretrain_epochs=10,
-        min_epochs=100,
-        min_delta=1e-4,
-        eval_interval=50,
-        eval_num_sequences=1000,
-        eval_real_sample_size=50000
+        epochs=train_epochs,
+        save_interval=save_interval,
+        patience=early_stop_patience,
+        pretrain_epochs=pretrain_epochs
     )

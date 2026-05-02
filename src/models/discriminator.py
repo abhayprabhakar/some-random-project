@@ -61,6 +61,16 @@ class SequenceDiscriminator(nn.Module):
         
         return score
 
+    def features(self, h, c):
+        """Return intermediate RNN features (before linear) for feature-matching losses."""
+        batch_size, seq_len, _ = h.size()
+        c_emb = self.class_embedding(c)
+        c_emb_expanded = c_emb.unsqueeze(1).expand(-1, seq_len, -1)
+        rnn_input = torch.cat([h, c_emb_expanded], dim=2)
+        out, _ = self.rnn(rnn_input)
+        # out: (batch, seq_len, hidden_dim)
+        return out
+
 if __name__ == "__main__":
     batch_size = 32
     seq_len = 20

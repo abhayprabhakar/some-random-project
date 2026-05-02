@@ -14,13 +14,39 @@ class SequenceGenerator:
         self.sequence_length = sequence_length
         self.stride = stride
 
-    def create_windows(self, df: pd.DataFrame, label_col: str = 'Attack Type') -> tuple:
+    @staticmethod
+    def _select_window_label(window_labels: np.ndarray, label_strategy: str, benign_label: int) -> int:
+        labels = window_labels.astype(int)
+
+        if label_strategy == 'mode':
+            return int(np.bincount(labels).argmax())
+
+        if label_strategy == 'attack_priority':
+            attack_labels = labels[labels != benign_label]
+            if len(attack_labels) > 0:
+                return int(np.bincount(attack_labels).argmax())
+            return benign_label
+
+        raise ValueError("label_strategy must be one of: 'mode', 'attack_priority'")
+
+    def create_windows(
+        self,
+        df: pd.DataFrame,
+        label_col: str = 'Attack Type',
+        label_strategy: str = 'mode',
+        benign_label: int = 0
+    ) -> tuple:
         """
         Slides a window across the dataframe to create 3D tensors.
         
         Args:
             df (pd.DataFrame): Fully preprocessed, numerical DataFrame.
             label_col (str): The column name representing the conditional class/label.
+                        label_strategy (str): Strategy for assigning one class to each window.
+                                                                    - 'mode': majority class in the window.
+                                                                    - 'attack_priority': if any attack label exists, prefer most
+                                                                        frequent non-benign class; otherwise benign.
+                        benign_label (int): Encoded benign class id used by attack_priority mode.
             
         Returns:
             X (np.ndarray): Tensor of shape (num_samples, seq_length, num_features)
@@ -46,12 +72,13 @@ class SequenceGenerator:
             X_sequences.append(window)
             
             if label_idx != -1:
-                # Target conditional label: we assign the "majority" attack class within this time window
-                # or simply take the most aggressive class. For C-TimeGAN, picking the mode is standard.
                 window_labels = window[:, label_idx]
-                # Cast to integer just in case, then find the most frequent label
-                mode_label = np.bincount(window_labels.astype(int)).argmax()
-                y_labels.append(mode_label)
+                selected_label = self._select_window_label(
+                    window_labels=window_labels,
+                    label_strategy=label_strategy,
+                    benign_label=benign_label
+                )
+                y_labels.append(selected_label)
 
         X = np.array(X_sequences)
         y = np.array(y_labels)

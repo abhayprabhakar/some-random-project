@@ -17,7 +17,14 @@ from generator import SequenceGenerator
 from autoencoder import SequenceAutoencoder
 from preprocessor import DataPreprocessor
 
-def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int = 16, hidden_dim: int = 24, input_dim: int = 51):
+def generate_synthetic_data(
+    num_samples: int,
+    seq_len: int = 20,
+    noise_dim: int = 16,
+    hidden_dim: int = 24,
+    input_dim: int = 51,
+    balanced_labels: bool = False,
+):
     """
     Loads the trained PyTorch Generator and Autoencoder to generate synthetic 5G traffic,
     then uses the saved Scikit-Learn transformers to map the AI numbers back to readable strings/bytes.
@@ -39,13 +46,28 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
         logging.error(f"Could not load scalers/encoders. Did you run the training/preprocessing pipeline first? Error: {e}")
         return
 
+    # Build a label distribution from the same raw sample used for training.
+    # Matching the real label prior is usually better for downstream fidelity
+    # than forcing a perfectly uniform synthetic class mix.
+    label_probs = None
+    if not balanced_labels:
+        try:
+            real_path = os.path.join(project_root, "data", "raw", "Combined.csv")
+            parser = DataPreprocessor()
+            df_real = pd.read_csv(real_path).head(100000).copy()
+            df_real_processed = parser.fit_transform(df_real)
+            attack_type_idx = df_real_processed.columns.get_loc('Attack Type')
+            label_values, label_counts = np.unique(df_real_processed.iloc[:, attack_type_idx].astype(int).values, return_counts=True)
+            label_probs = label_counts / label_counts.sum()
+            label_values = label_values.astype(int)
+            logging.info(f"Using real label prior for synthetic sampling: {dict(zip(label_values.tolist(), label_probs.round(4).tolist()))}")
+        except Exception as e:
+            logging.warning(f"Could not derive real label distribution; falling back to uniform labels. Error: {e}")
+            label_probs = None
+
     num_classes = len(categorical_encoders['Attack Type'].classes_)
     input_dim = len(feature_columns)
     categorical_sizes = [len(categorical_encoders[col].classes_) for col in categorical_cols]
-    if "Attack Type" not in feature_columns:
-        logging.error("'Attack Type' column missing from feature metadata.")
-        return
-    attack_type_idx = feature_columns.index("Attack Type")
 
     # 2. Initialize Models
     autoencoder = SequenceAutoencoder(
@@ -57,9 +79,16 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
     generator = SequenceGenerator(noise_dim=noise_dim, hidden_dim=hidden_dim, num_classes=num_classes).to(device)
     
     # 3. Load Trained Checkpoint
-    checkpoint_path = os.path.join(project_root, "checkpoints", "latest_checkpoint.pt")
-    if not os.path.exists(checkpoint_path):
-        logging.error(f"No trained checkpoint found at {checkpoint_path}. Train the model first!")
+    checkpoint_dir = os.path.join(project_root, "checkpoints")
+    preferred_paths = [
+        os.path.join(checkpoint_dir, "model_final.pt"),
+        os.path.join(checkpoint_dir, "latest_checkpoint.pt"),
+    ]
+    checkpoint_path = next((path for path in preferred_paths if os.path.exists(path)), None)
+    if checkpoint_path is None:
+        logging.error(
+            f"No trained checkpoint found in {checkpoint_dir}. Train the model first!"
+        )
         return
         
     logging.info(f"Loading trained weights from: {checkpoint_path}")
@@ -76,10 +105,18 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
         # Generate random noise
         z = torch.randn(num_samples, seq_len, noise_dim).to(device)
         
-        # Balanced attack classes to avoid label collapse
-        repeats = (num_samples + num_classes - 1) // num_classes
-        labels = torch.arange(num_classes, device=device).repeat(repeats)[:num_samples]
-        labels = labels[torch.randperm(num_samples, device=device)]
+        # Use balanced class labels by default so synthetic data covers every attack type.
+        # This is more useful for evaluation than drawing labels from a small random sample.
+        if balanced_labels:
+            base_labels = np.tile(np.arange(num_classes), int(np.ceil(num_samples / num_classes)))[:num_samples]
+            np.random.shuffle(base_labels)
+            labels = torch.LongTensor(base_labels).to(device)
+        elif label_probs is not None:
+            # Sample labels from the observed real class prior.
+            labels_np = np.random.choice(label_values, size=num_samples, p=label_probs)
+            labels = torch.LongTensor(labels_np).to(device)
+        else:
+            labels = torch.randint(0, num_classes, (num_samples,)).to(device)
         
         # Pass through Generator to get the 24-Dimensional Latent sequence
         fake_latent_seqs = generator(z, labels)
@@ -112,9 +149,6 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
             col_idx = feature_columns.index(col)
             full_features[:, :, col_idx] = fake_cat_indices[idx].float()
 
-        # Force Attack Type to match the conditioning label
-        full_features[:, :, attack_type_idx] = labels.unsqueeze(1).expand(-1, seq_len).float()
-
     # 5. Inverse Transform (Convert back to Pandas DataFrame)
     # The neural network outputs 3D tensors (Samples, Seq_Len, Features)
     # We must flatten it to 2D (Samples * Seq_Len, Features) to save as a CSV
@@ -138,5 +172,5 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
     logging.info(f"Saved synthetic array to {out_path}")
 
 if __name__ == "__main__":
-    # Generate 100 sequences of 20 flows (2,000 fake flows total)
-    generate_synthetic_data(num_samples=100)
+    # Generate a larger synthetic set using the real class distribution by default.
+    generate_synthetic_data(num_samples=2000, balanced_labels=False)
