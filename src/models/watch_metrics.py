@@ -18,6 +18,32 @@ def watch_and_plot():
     Background script to constantly read the real-time metrics generated 
     by `train.py` and output an updating graph of the AI's learning curve.
     """
+    min_epoch = 100
+    def load_metrics(metrics_file: str) -> pd.DataFrame:
+        try:
+            df = pd.read_csv(metrics_file)
+        except Exception:
+            df = pd.read_csv(metrics_file, header=None)
+
+        if 'epoch' in df.columns:
+            return df
+
+        df = pd.read_csv(metrics_file, header=None)
+        col_count = df.shape[1]
+
+        if col_count == 3:
+            df.columns = ['epoch', 'd_loss', 'g_loss']
+        elif col_count == 4:
+            df.columns = ['epoch', 'ae_loss', 'd_loss', 'g_loss']
+        elif col_count == 5:
+            df.columns = ['epoch', 'ae_loss', 'sup_loss', 'd_loss', 'g_loss']
+        elif col_count >= 6:
+            df = df.iloc[:, :6]
+            df.columns = ['epoch', 'ae_loss', 'sup_loss', 'd_loss', 'g_loss', 'g_sup_loss']
+        else:
+            df.columns = ['epoch'] + [f"metric_{i}" for i in range(1, col_count)]
+
+        return df
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
     
@@ -50,8 +76,11 @@ def watch_and_plot():
             if current_modified > last_modified:
                 last_modified = current_modified
                 
-                df = pd.read_csv(metrics_path)
+                df = load_metrics(metrics_path)
                 
+                # Filter to show only later epochs
+                df = df[df['epoch'] >= min_epoch]
+
                 # Minimum wait until we have at least 2 points to draw a curve
                 if len(df) < 2:
                     plt.pause(2)

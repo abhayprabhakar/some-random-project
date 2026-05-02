@@ -42,6 +42,7 @@ dist/
 Thumbs.db
 
 # Data and model artifacts
+data/raw/Combined.csv
 data/raw/
 data/synthetic/
 checkpoints/

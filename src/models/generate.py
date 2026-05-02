@@ -42,6 +42,10 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
     num_classes = len(categorical_encoders['Attack Type'].classes_)
     input_dim = len(feature_columns)
     categorical_sizes = [len(categorical_encoders[col].classes_) for col in categorical_cols]
+    if "Attack Type" not in feature_columns:
+        logging.error("'Attack Type' column missing from feature metadata.")
+        return
+    attack_type_idx = feature_columns.index("Attack Type")
 
     # 2. Initialize Models
     autoencoder = SequenceAutoencoder(
@@ -72,9 +76,10 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
         # Generate random noise
         z = torch.randn(num_samples, seq_len, noise_dim).to(device)
         
-        # Give it random attack classes (or you can force it to generate purely one type!)
-        # e.g., labels = torch.full((num_samples,), 1) to generate purely class 1
-        labels = torch.randint(0, num_classes, (num_samples,)).to(device)
+        # Balanced attack classes to avoid label collapse
+        repeats = (num_samples + num_classes - 1) // num_classes
+        labels = torch.arange(num_classes, device=device).repeat(repeats)[:num_samples]
+        labels = labels[torch.randperm(num_samples, device=device)]
         
         # Pass through Generator to get the 24-Dimensional Latent sequence
         fake_latent_seqs = generator(z, labels)
@@ -106,6 +111,9 @@ def generate_synthetic_data(num_samples: int, seq_len: int = 20, noise_dim: int 
         for idx, col in enumerate(categorical_cols):
             col_idx = feature_columns.index(col)
             full_features[:, :, col_idx] = fake_cat_indices[idx].float()
+
+        # Force Attack Type to match the conditioning label
+        full_features[:, :, attack_type_idx] = labels.unsqueeze(1).expand(-1, seq_len).float()
 
     # 5. Inverse Transform (Convert back to Pandas DataFrame)
     # The neural network outputs 3D tensors (Samples, Seq_Len, Features)

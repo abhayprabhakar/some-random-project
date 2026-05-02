@@ -220,6 +220,27 @@ class RobustTrainer:
             avg_sup_loss = epoch_sup_loss / len(dataloader)
             logging.info(f"[AE Pretrain {epoch + 1}/{epochs}] - Avg AE_Loss: {avg_ae_loss:.4f} | Avg Sup_Loss: {avg_sup_loss:.4f}")
 
+    def run_periodic_evaluation(self, epoch: int, num_sequences: int, real_sample_size: int):
+        """Generates synthetic data and runs evaluation pipeline at intervals."""
+        if num_sequences <= 0:
+            return
+
+        import sys
+        eval_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'evaluation'))
+        if eval_dir not in sys.path:
+            sys.path.append(eval_dir)
+
+        from generate import generate_synthetic_data
+        from evaluate_pipeline import run_evaluation_pipeline
+
+        logging.info(
+            f"Running periodic evaluation at Epoch {epoch + 1} "
+            f"(synthetic sequences: {num_sequences}, real sample: {real_sample_size})"
+        )
+        self.save_checkpoint(epoch=epoch)
+        generate_synthetic_data(num_samples=num_sequences)
+        run_evaluation_pipeline(real_sample_size=real_sample_size)
+
     def train_step(self, real_sequences: torch.Tensor, labels: torch.Tensor, lambda_gp=10.0, n_critic=3):
         """
         Executes one full step of Wasserstein GAN training.
@@ -284,7 +305,19 @@ class RobustTrainer:
         
         return ae_loss.item(), sup_loss.item(), d_loss.item(), g_loss.item(), g_sup_loss.item()
 
-    def fit(self, dataloader, epochs: int, save_interval: int = 5, patience: int = 15, pretrain_epochs: int = 10):
+    def fit(
+        self,
+        dataloader,
+        epochs: int,
+        save_interval: int = 5,
+        patience: int = 15,
+        pretrain_epochs: int = 10,
+        min_epochs: int = 50,
+        min_delta: float = 1e-4,
+        eval_interval: int = 0,
+        eval_num_sequences: int = 1000,
+        eval_real_sample_size: int = 50000
+    ):
         """
         Main training orchestration loop. Includes Graceful Interruption and detailed progress reporting.
         Automates Early Stopping based on WGAN-GP convergence (Discriminator loss nears 0).
@@ -300,7 +333,7 @@ class RobustTrainer:
             with open(metrics_file, 'w') as f:
                 f.write("epoch,ae_loss,sup_loss,d_loss,g_loss,g_sup_loss\n")
                 
-        best_d_loss_val = float('inf')
+        best_composite_score = float('inf')
         patience_counter = 0
         
         if pretrain_epochs > 0 and not resumed and dataloader is not None:
@@ -363,19 +396,33 @@ class RobustTrainer:
                             f"{avg_d_loss:.6f},{avg_g_loss:.6f},{avg_g_sup_loss:.6f}\n"
                         )
                         
-                    # Early Stopping Evaluator (WGAN converges as Discriminator Loss absolute approaches 0)
-                    current_d_loss_val = abs(avg_d_loss)
-                    if current_d_loss_val < best_d_loss_val:
-                        best_d_loss_val = current_d_loss_val
+                    # Early Stopping Evaluator (Composite score: AE + Supervisor + Generator Supervisor)
+                    composite_score = avg_ae_loss + avg_sup_loss + avg_g_sup_loss
+                    if composite_score < (best_composite_score - min_delta):
+                        best_composite_score = composite_score
                         patience_counter = 0
                     else:
-                        patience_counter += 1
-                        logging.info(f"No improvement in Discriminator Loss metric. Patience: {patience_counter}/{patience}")
-                        if patience_counter >= patience:
-                            logging.warning(f"EARLY STOPPING triggered! Network stopped progressing after {epoch + 1} Epochs.")
-                            self.save_checkpoint(epoch=epoch, is_final=True)
-                            break
+                        if (epoch + 1) >= min_epochs:
+                            patience_counter += 1
+                            logging.info(
+                                "No improvement in composite score (AE + Sup + G_Sup). "
+                                f"Patience: {patience_counter}/{patience} (min_delta={min_delta})"
+                            )
+                            if patience_counter >= patience:
+                                logging.warning(
+                                    f"EARLY STOPPING triggered! Network stopped progressing after {epoch + 1} Epochs."
+                                )
+                                self.save_checkpoint(epoch=epoch, is_final=True)
+                                break
+                        else:
+                            logging.info(
+                                f"Warmup active: early stopping disabled until Epoch {min_epochs}."
+                            )
                 
+                # Periodic Evaluation
+                if eval_interval > 0 and (epoch + 1) % eval_interval == 0:
+                    self.run_periodic_evaluation(epoch, eval_num_sequences, eval_real_sample_size)
+
                 # Checkpointing
                 if epoch > 0 and epoch % save_interval == 0:
                     logging.info(f"--> Reached Save Interval. Checkpointing Epoch {epoch}...")
@@ -461,4 +508,15 @@ if __name__ == "__main__":
     # Start training! Set to a massive epoch number (1,000,000) so it runs infinitely 
     # until Early Stopping kicks in or you hit Ctrl+C.
     logging.info("Initiating indefinite training. Will halt automatically via Early Stopping or manual Ctrl+C.")
-    trainer.fit(dataloader=dataloader, epochs=1000000, save_interval=5, patience=25, pretrain_epochs=10)
+    trainer.fit(
+        dataloader=dataloader,
+        epochs=1000000,
+        save_interval=5,
+        patience=25,
+        pretrain_epochs=10,
+        min_epochs=100,
+        min_delta=1e-4,
+        eval_interval=50,
+        eval_num_sequences=1000,
+        eval_real_sample_size=50000
+    )
