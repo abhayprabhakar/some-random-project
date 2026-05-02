@@ -18,8 +18,8 @@ class NIDDParser:
         """Loads the dataset into a Pandas DataFrame."""
         try:
             logging.info(f"Loading data from {self.file_path}...")
-            # For demonstration, we assume a CSV format for the extracted NetFlow/tabular 5G-NIDD data
-            self.raw_data = pd.read_csv(self.file_path)
+            # low_memory=False prevents chunk-wise dtype inference warnings on mixed-type columns.
+            self.raw_data = pd.read_csv(self.file_path, low_memory=False)
             logging.info(f"Data successfully loaded. Shape: {self.raw_data.shape}")
             return self.raw_data
         except FileNotFoundError:

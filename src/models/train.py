@@ -138,7 +138,8 @@ class RobustTrainer:
         interpolated.requires_grad_(True)
         
         # Calculate probability of interpolated examples
-        prob_interpolated = self.discriminator(interpolated, labels)
+        with torch.backends.cudnn.flags(enabled=False):
+            prob_interpolated = self.discriminator(interpolated, labels)
         
         # Calculate gradients of probabilities with respect to examples
         gradients = grad(outputs=prob_interpolated, inputs=interpolated,
@@ -266,8 +267,9 @@ class RobustTrainer:
             fake_emb = self.generator(z, labels).detach() # Detach so we don't backprop through G
             
             # Calculate WGAN Loss
-            real_validity = self.discriminator(real_emb, labels)
-            fake_validity = self.discriminator(fake_emb, labels)
+            with torch.backends.cudnn.flags(enabled=False):
+                real_validity = self.discriminator(real_emb, labels)
+                fake_validity = self.discriminator(fake_emb, labels)
             
             # Gradient penalty
             gradient_penalty = self.calculate_gradient_penalty(real_emb, fake_emb, labels)

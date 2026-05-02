@@ -45,7 +45,11 @@ class SequenceDiscriminator(nn.Module):
         
         # We can either inspect the final step only or all steps. 
         # Typically timeGAN discriminates all steps
-        out, _ = self.rnn(rnn_input)
+        # WGAN-GP needs second-order gradients for gradient penalty.
+        # CuDNN RNN kernels do not support double backward, so disable CuDNN
+        # for this LSTM forward pass when training on GPU.
+        with torch.backends.cudnn.flags(enabled=False):
+            out, _ = self.rnn(rnn_input)
         # out: (batch, seq_len, hidden_dim)
         
         score = self.linear(out) 
